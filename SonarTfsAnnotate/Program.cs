@@ -11,6 +11,7 @@ using System.Net;
 using System.Text;
 using Microsoft.TeamFoundation.VersionControl.Client;
 using Microsoft.VisualStudio.Services.Common;
+using PowerArgs;
 
 namespace SonarSource.TfsAnnotate
 {
@@ -26,41 +27,27 @@ namespace SonarSource.TfsAnnotate
                 Console.InputEncoding = Encoding.UTF8;
                 Console.OutputEncoding = Encoding.UTF8;
 
-                if (args.Length != 0)
-                {
-                    Console.Error.WriteLine(
-                        "This program is only expected to be called by the SonarQube TFS SCM plugin.");
-                    return 1;
-                }
-
-                Console.WriteLine("Enter your credentials");
-                Console.Out.Flush();
-                string username = Console.ReadLine();
-                string password = Console.ReadLine();
-                string pat = Console.ReadLine();
+                var options = Args.Parse<Options>(args);
 
                 VssCredentials credentials;
-
-                if (!string.IsNullOrEmpty(pat))
+                if (!string.IsNullOrEmpty(options.PersonalAccessToken))
                 {
-                    credentials = new VssCredentials(new VssBasicCredential(new NetworkCredential("", pat)));
+                    var credential = new NetworkCredential(userName: "", password: options.PersonalAccessToken);
+                    credentials = new VssCredentials(new VssBasicCredential(credential));
                 }
-                else if (!string.IsNullOrEmpty(username) || !string.IsNullOrEmpty(password))
+                else if (!string.IsNullOrEmpty(options.UserName) || !string.IsNullOrEmpty(options.Password))
                 {
-                    credentials = new VssCredentials(new WindowsCredential(new NetworkCredential(username, password)));
+                    var credential = new NetworkCredential(options.UserName, options.Password);
+                    credentials = new VssCredentials(new WindowsCredential(credential));
                 }
                 else
                 {
-                    credentials = new VssCredentials(true);
+                    credentials = new VssCredentials(useDefaultCredentials: true);
                 }
 
-                Console.WriteLine("Enter the Collection URI");
-                Console.Out.Flush();
-                string serverUriString = Console.ReadLine();
-
-                if (!string.IsNullOrEmpty(serverUriString))
+                if (!string.IsNullOrEmpty(options.CollectionUri))
                 {
-                    if (!SetServerUri(serverUriString))
+                    if (!SetServerUri(options.CollectionUri))
                     {
                         return 1;
                     }
@@ -71,17 +58,21 @@ namespace SonarSource.TfsAnnotate
                     var cache = new AccountCache(foundationServiceProvider);
                     if (serverUri != null)
                     {
-                        if (!UpdateWorkspaceCache(foundationServiceProvider))
-                        {
-                            return 1;
-                        }
+                        UpdateWorkspaceCache(foundationServiceProvider);
                     }
 
-                    Console.Out.WriteLine("Enter the paths to annotate");
+                    if (!string.IsNullOrEmpty(options.FileName))
+                    {
+                        AnnotateFile(options.FileName, foundationServiceProvider, cache);
+                        Console.Out.Flush();
+                        return 0;
+                    }
+
+                    Console.Out.WriteLine("Enter the local paths to annotate:");
                     Console.Out.Flush();
 
                     string path;
-                    while ((path = Console.ReadLine()) != null)
+                    while (!string.IsNullOrEmpty(path = Console.ReadLine()))
                     {
                         try
                         {
@@ -94,93 +85,106 @@ namespace SonarSource.TfsAnnotate
                                 continue;
                             }
 
-                            if (!Workstation.Current.IsMapped(path))
-                            {
-                                FailOnFile("is not in a mapped TFS workspace: " + path);
-                                continue;
-                            }
-
-                            var workspaceInfo = Workstation.Current.GetLocalWorkspaceInfo(path);
-                            var version = new WorkspaceVersionSpec(workspaceInfo);
-
-                            if (serverUri == null || workspaceInfo.ServerUri.AbsoluteUri != serverUri.AbsoluteUri)
-                            {
-                                serverUri = workspaceInfo.ServerUri;
-                                if (!UpdateWorkspaceCache(foundationServiceProvider))
-                                {
-                                    return 1;
-                                }
-                            }
-
-                            var versionControlServer = foundationServiceProvider.GetVersionControlServer(serverUri);
-
-                            var annotatedFile = new FileAnnotator(versionControlServer).Annotate(path, version);
-                            if (annotatedFile == null)
-                            {
-                                FailOnFile("is not yet checked-in: " + path);
-                                continue;
-                            }
-
-                            if (annotatedFile.IsBinary())
-                            {
-                                FailOnFile("is a binary one: " + path);
-                                continue;
-                            }
-
-                            bool failed = false;
-                            for (int i = 0; !failed && i < annotatedFile.Lines(); i++)
-                            {
-                                var state = annotatedFile.State(i);
-                                if (state != AnnotationState.Committed)
-                                {
-                                    FailOnFile("line " + (i + 1) + " has not yet been checked-in (" + state + "): " +
-                                               path);
-                                    failed = true;
-                                }
-                            }
-
-                            if (failed)
-                            {
-                                continue;
-                            }
-
-                            Console.WriteLine(annotatedFile.Lines());
-                            for (int i = 0; i < annotatedFile.Lines(); i++)
-                            {
-                                var changeSet = annotatedFile.Changeset(i);
-                                Console.Write(changeSet.ChangesetId);
-                                Console.Write('\t');
-                                Console.Write(cache.BuildUserName(serverUri, changeSet.Owner));
-                                Console.Write('\t');
-                                Console.Write(ToUnixTimestampInMs(changeSet.CreationDate));
-                                Console.Write('\t');
-                                Console.WriteLine(annotatedFile.Data(i));
-                            }
+                            AnnotateFile(path, foundationServiceProvider, cache);
                         }
                         catch (Exception e)
                         {
                             FailOnFile(e.Message);
                         }
                     }
-
-                    Console.Out.Flush();
                 }
 
+                Console.Out.Flush();
                 return 0;
+            }
+            catch (ArgException ex)
+            {
+                FailOnProject(ex.Message);
+                Console.WriteLine(ArgUsage.GenerateUsageFromTemplate<Options>());
+                Console.Out.Flush();
+                return 1;
             }
             catch (Exception e)
             {
                 FailOnProject(e.Message);
+                Console.Out.Flush();
                 return 1;
             }
         }
 
-        private static bool UpdateWorkspaceCache(IFoundationServiceProvider foundationServiceProvider)
+        private static void AnnotateFile(
+            string localPath,
+            FoundationServiceProvider foundationServiceProvider,
+            AccountCache cache)
+        {
+            if (!Workstation.Current.IsMapped(localPath))
+            {
+                FailOnFile("is not in a mapped TFS workspace: " + localPath);
+                return;
+            }
+
+            var workspaceInfo = Workstation.Current.GetLocalWorkspaceInfo(localPath);
+            var version = new WorkspaceVersionSpec(workspaceInfo);
+
+            if (serverUri == null || workspaceInfo.ServerUri.AbsoluteUri != serverUri.AbsoluteUri)
+            {
+                serverUri = workspaceInfo.ServerUri;
+                UpdateWorkspaceCache(foundationServiceProvider);
+            }
+
+            var versionControlServer = foundationServiceProvider.GetVersionControlServer(serverUri);
+
+            var annotatedFile = new FileAnnotator(versionControlServer).Annotate(localPath, version);
+            if (annotatedFile == null)
+            {
+                FailOnFile("is not yet checked-in: " + localPath);
+                return;
+            }
+
+            if (annotatedFile.IsBinary())
+            {
+                FailOnFile("is a binary one: " + localPath);
+                return;
+            }
+
+            bool failed = false;
+            for (int i = 0; !failed && i < annotatedFile.Lines(); i++)
+            {
+                var state = annotatedFile.State(i);
+                if (state == AnnotationState.Committed)
+                {
+                    // ok
+                    continue;
+                }
+
+                FailOnFile($"line {i + 1} has not yet been checked-in ({state}): {localPath}");
+                failed = true;
+            }
+
+            if (failed)
+            {
+                return;
+            }
+
+            Console.WriteLine(annotatedFile.Lines());
+            for (int i = 0; i < annotatedFile.Lines(); i++)
+            {
+                var changeSet = annotatedFile.Changeset(i);
+                Console.Write(changeSet.ChangesetId);
+                Console.Write('\t');
+                Console.Write(cache.BuildUserName(serverUri, changeSet.Owner));
+                Console.Write('\t');
+                Console.Write(ToUnixTimestampInMs(changeSet.CreationDate));
+                Console.Write('\t');
+                Console.WriteLine(annotatedFile.Data(i));
+            }
+        }
+
+        private static void UpdateWorkspaceCache(IFoundationServiceProvider foundationServiceProvider)
         {
             var versionControlServer = foundationServiceProvider.GetVersionControlServer(serverUri);
             Workstation.Current.EnsureUpdateWorkspaceInfoCache(versionControlServer,
                 versionControlServer.AuthorizedUser);
-            return true;
         }
 
         private static bool SetServerUri(string serverUriString)
